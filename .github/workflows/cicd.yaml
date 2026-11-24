@@ -139,7 +139,7 @@ jobs:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
         env:
-          IMAGE_REF: ${{ needs.build.outputs.image }}:${{ github.sha }}
+          IMAGE_REF: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
           REGISTRY_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.ALIYUN_ACR_PASSWORD }}
