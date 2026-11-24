@@ -1,0 +1,249 @@
+name: CI/CD
+
+# 触发：
+#   - push 到 main        → ci → build & push → deploy
+#   - pull_request        → ci → build（只验证 Dockerfile，不登录仓库、不部署）
+#   - 手动触发（Actions 页面 Run workflow）
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一 ref 串行执行，避免两次部署同时操作同一台服务器
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: zaikou-ai
+  CONTAINER_NAME: zaikou-ai
+  APP_PORT: "8080"
+  DEPLOY_DIR: /opt/zaikou-ai
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. CI：安装依赖 + 语法检查 + 导入冒烟测试
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI / lint & import smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m compileall -q app.py agent.py database.py rag.py tools.py
+
+      - name: Import smoke test
+        env:
+          OPENAI_API_KEY: sk-ci-placeholder
+          OPENAI_BASE_URL: https://api.openai.com/v1
+          OPENAI_MODEL: gpt-4o-mini
+          TAVILY_API_KEY: tvly-ci-placeholder
+          LANGSMITH_TRACING: "false"
+        run: python -c "import app; print('import smoke test OK, routes =', len(app.app.routes))"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build：构建镜像；非 PR 时推送到阿里云 ACR（latest + commit sha）
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build / push image to Aliyun ACR
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.image_ref.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image reference
+        id: image_ref
+        env:
+          REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          NAMESPACE: ${{ secrets.ALIYUN_ACR_NAMESPACE }}
+        run: |
+          if [ -n "${REGISTRY}" ] && [ -n "${NAMESPACE}" ]; then
+            IMAGE="${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}"
+            # Docker 镜像名必须全小写
+            echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+          else
+            # fork PR 拿不到 Secrets：只做本地构建，不推送
+            echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.image_ref.outputs.image }}:latest
+            ${{ steps.image_ref.outputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write build summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### 镜像已推送阿里云 ACR"
+            echo ""
+            echo "- 镜像：\`${{ steps.image_ref.outputs.image }}:${{ github.sha }}\`"
+            echo "- Commit：\`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. Deploy：SSH 到阿里云 ECS，拉取镜像、重建容器、健康检查、失败回滚
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy / Aliyun ECS
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_REF: ${{ needs.build.outputs.image }}:${{ github.sha }}
+          REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          REGISTRY_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+          DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
+        with:
+          host: ${{ secrets.ALIYUN_HOST }}
+          username: ${{ secrets.ALIYUN_USER }}
+          key: ${{ secrets.ALIYUN_SSH_KEY }}
+          port: ${{ secrets.ALIYUN_SSH_PORT || '22' }}
+          envs: IMAGE_REF,REGISTRY,REGISTRY_USER,REGISTRY_PASSWORD,DEPLOY_DIR,CONTAINER_NAME,APP_PORT
+          command_timeout: 10m
+          script: |
+            set -eu
+
+            echo "==> 目标镜像: ${IMAGE_REF}"
+            echo "==> 部署目录: ${DEPLOY_DIR}"
+
+            # 0) 前置检查
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "ERROR: 服务器未安装 Docker，请先按 README 完成环境准备"
+              exit 1
+            fi
+
+            if [ ! -s "${DEPLOY_DIR}/.env" ]; then
+              echo "ERROR: ${DEPLOY_DIR}/.env 不存在或为空，请先在服务器上创建运行时环境变量文件（见 README）"
+              exit 1
+            fi
+
+            mkdir -p "${DEPLOY_DIR}/data" "${DEPLOY_DIR}/chroma_db" "${DEPLOY_DIR}/uploads"
+
+            # 1) 备份当前运行镜像，供部署失败时回滚
+            if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+              OLD_IMAGE_ID="$(docker inspect -f '{{.Image}}' "${CONTAINER_NAME}")"
+              docker tag "${OLD_IMAGE_ID}" "${CONTAINER_NAME}:rollback"
+              echo "==> 已保存回滚镜像: ${CONTAINER_NAME}:rollback"
+            fi
+
+            # 2) 登录阿里云 ACR 并拉取新镜像
+            printf '%s' "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" --username "${REGISTRY_USER}" --password-stdin
+            docker pull "${IMAGE_REF}"
+
+            # 3) 重建容器（数据目录挂载到宿主机，重建不丢对话记录与文档数据）
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --restart unless-stopped \
+              -p "${APP_PORT}:8080" \
+              -v "${DEPLOY_DIR}/.env:/app/.env:ro" \
+              -v "${DEPLOY_DIR}/data:/app/data" \
+              -v "${DEPLOY_DIR}/chroma_db:/app/chroma_db" \
+              -v "${DEPLOY_DIR}/uploads:/app/uploads" \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              "${IMAGE_REF}"
+
+            # 4) 健康检查（最多等待 90 秒）
+            check_app() {
+              if command -v curl >/dev/null 2>&1; then
+                curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/" >/dev/null 2>&1
+              else
+                docker exec "${CONTAINER_NAME}" python -c \
+                  "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=5)" >/dev/null 2>&1
+              fi
+            }
+
+            healthy=0
+            for i in $(seq 1 30); do
+              if check_app; then
+                healthy=1
+                echo "==> 健康检查通过（第 ${i} 次探测）"
+                break
+              fi
+              if [ -z "$(docker ps -q --filter "name=^/${CONTAINER_NAME}$")" ]; then
+                echo "==> 容器已退出，最近日志如下："
+                docker logs --tail 100 "${CONTAINER_NAME}" 2>&1 || true
+                break
+              fi
+              sleep 3
+            done
+
+            # 5) 健康检查失败则自动回滚到上一个镜像
+            if [ "${healthy}" -ne 1 ]; then
+              echo "ERROR: 健康检查失败，开始回滚"
+              docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+              if docker image inspect "${CONTAINER_NAME}:rollback" >/dev/null 2>&1; then
+                docker run -d \
+                  --name "${CONTAINER_NAME}" \
+                  --restart unless-stopped \
+                  -p "${APP_PORT}:8080" \
+                  -v "${DEPLOY_DIR}/.env:/app/.env:ro" \
+                  -v "${DEPLOY_DIR}/data:/app/data" \
+                  -v "${DEPLOY_DIR}/chroma_db:/app/chroma_db" \
+                  -v "${DEPLOY_DIR}/uploads:/app/uploads" \
+                  --log-opt max-size=10m \
+                  --log-opt max-file=3 \
+                  "${CONTAINER_NAME}:rollback"
+                echo "==> 已回滚到上一个可用版本，请检查日志后重新提交"
+              else
+                echo "==> 无可用回滚镜像，请手动排查"
+              fi
+              exit 1
+            fi
+
+            # 6) 清理悬空镜像并输出容器状态
+            docker image prune -f >/dev/null 2>&1 || true
+            docker ps --filter "name=^/${CONTAINER_NAME}$" \
+              --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
