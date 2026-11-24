@@ -1,0 +1,26 @@
+# Environments
+.env
+.env.*
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Local data and caches
+data/
+chroma_db/
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / VCS
+.git/
+.gitignore
+.vscode/
+.idea/
